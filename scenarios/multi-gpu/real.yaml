@@ -1,0 +1,11 @@
+model: "meta-llama/Llama-3.1-8B"
+tensor_parallel_size: 2
+dtype: half
+load_format: "dummy"
+block_size: 16
+max_num_batched_tokens: 2048
+max_num_seqs: 32
+gpu_memory_utilization: 0.9
+skip_tokenizer_init: true
+enable_prefix_caching: false
+generation_config: "vllm"

@@ -66,9 +66,6 @@ pub struct NemotronHModel {
     kv_bytes_per_request_per_device: u64,
 
     #[serde(skip, default)]
-    scheduler_model_weight_bytes: u64,
-
-    #[serde(skip, default)]
     scheduler_kv_bytes_per_request: u64,
 
     #[serde(skip, default)]
@@ -375,11 +372,6 @@ impl NemotronHModel {
             .sum()
     }
 
-    fn compute_scheduler_model_weight_bytes(&self, parallel: ParallelStrategy) -> u64 {
-        self.weight_bytes_per_device
-            .div_ceil(Self::scheduler_memory_divisor(parallel.ep))
-    }
-
     fn compute_scheduler_kv_bytes_per_token(&self, parallel: ParallelStrategy) -> u64 {
         self.kv_bytes_per_token_per_device
             .div_ceil(Self::scheduler_memory_divisor(parallel.ep))
@@ -488,7 +480,6 @@ impl Model for NemotronHModel {
             self.compute_kv_bytes_per_token_per_device(&block_kinds);
         self.kv_bytes_per_request_per_device =
             self.compute_kv_bytes_per_request_per_device(&block_kinds);
-        self.scheduler_model_weight_bytes = self.compute_scheduler_model_weight_bytes(parallel);
         self.scheduler_kv_bytes_per_request = self
             .kv_bytes_per_request_per_device
             .div_ceil(Self::scheduler_memory_divisor(parallel.ep));
@@ -506,10 +497,6 @@ impl Model for NemotronHModel {
 
     fn kv_bytes_per_request_per_device(&self) -> u64 {
         self.kv_bytes_per_request_per_device
-    }
-
-    fn scheduler_model_weight_bytes(&self) -> u64 {
-        self.scheduler_model_weight_bytes
     }
 
     fn scheduler_kv_bytes_per_token(&self) -> u64 {
@@ -573,7 +560,6 @@ mod tests {
             weight_bytes_per_device: 0,
             kv_bytes_per_token_per_device: 0,
             kv_bytes_per_request_per_device: 0,
-            scheduler_model_weight_bytes: 0,
             scheduler_kv_bytes_per_request: 0,
             scheduler_kv_bytes_per_token: 0,
         }

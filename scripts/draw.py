@@ -1,116 +1,193 @@
+"""Plot complete serving results. The first run is the scatter reference."""
+
+import argparse
+import math
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import typer
-from simthesizer.throughput import ThroughputError, align_series, compute_throughput_series
-from matplotlib import pyplot as plt
-from matplotlib.ticker import FuncFormatter
-
-
-def y_tick_formatter(value: float, _position: float) -> str:
-    if abs(value) >= 1000.0:
-        return f"{value / 1000.0:.0f}K"
-    return f"{value:.0f}"
+from results import (
+    LATENCIES,
+    load_runs,
+    measurements,
+    metric_unit,
+    positive_float,
+    protect_output,
+    throughput,
+)
 
 
-def discover_series_specs(output_dir: Path) -> list[tuple[str, Path, str, float]]:
-    return [
-        (label, path, color, linewidth)
-        for label, path, color, linewidth in [
-            ("baseline", output_dir / "baseline.jsonl", "#b3b3b3", 3.5),
-            ("simthesizer", output_dir / "simthesizer.jsonl", "#2f9e44", 2.8),
-            ("real", output_dir / "real.jsonl", "#d9480f", 2.8),
-        ]
-        if path.is_file()
-    ]
+def draw(runs, output, metrics, view, window, title, columns, size):
+    import matplotlib
 
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
 
-def align_values_to_axis(
-    series_times: list[float],
-    series_values: list[float],
-    times: list[float],
-) -> list[float]:
-    if not series_times:
-        return [0.0 for _ in times]
-    _, aligned_values, _ = align_series(
-        series_times,
-        series_values,
-        times,
-        [0.0 for _ in times],
+    samples = [measurements(run) for run in runs]
+    end = max(sample["makespan"][()] for sample in samples)
+    columns = min(columns, len(metrics))
+    rows = math.ceil(len(metrics) / columns)
+    figure, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=size or (5 * columns, 3.5 * rows),
+        squeeze=False,
+        layout="constrained",
     )
-    return aligned_values
-
-
-def draw_plot(
-    output_path: Path,
-    series_specs: list[tuple[str, Path, str, float]],
-    window_sec: float,
-    title: str | None,
-) -> None:
-    series_data = [
-        (label, *compute_throughput_series(path, window_sec), color, linewidth)
-        for label, path, color, linewidth in series_specs
-    ]
-    max_len = max(
-        (len(series_times) for _, series_times, _, _, _ in series_data), default=0
-    )
-    times = [index * window_sec for index in range(max(max_len, 1))]
-
-    fig, ax = plt.subplots(figsize=(8.0, 4.8), constrained_layout=True)
-    fig.patch.set_facecolor("#dddddd")
-    ax.set_facecolor("#dddddd")
-    ax.grid(True, color="#bfbfbf", linewidth=1.0)
-    ax.set_axisbelow(True)
-
-    for label, series_times, series_values, color, linewidth in series_data:
-        ax.plot(
-            times,
-            align_values_to_axis(series_times, series_values, times),
-            color=color,
-            linewidth=linewidth,
-            label=label,
-        )
-
-    for spine in ax.spines.values():
-        spine.set_linewidth(1.8)
-
-    ax.tick_params(axis="both", labelsize=14, width=1.6, length=6, pad=10)
-    ax.yaxis.set_major_formatter(FuncFormatter(y_tick_formatter))
-    ax.set_xlabel("Time (sec)", fontsize=20)
-    ax.set_ylabel("Throughput (tok/s)", fontsize=20)
+    colors = plt.get_cmap("tab10").colors
+    for ax, metric in zip(axes.flat, metrics):
+        ax.grid(True, alpha=0.2)
+        ax.set_axisbelow(True)
+        if metric == "throughput":
+            for i, run in enumerate(runs):
+                edges, values = throughput(run, window, end)
+                ax.stairs(
+                    values,
+                    edges,
+                    label=run.label,
+                    color=colors[i % len(colors)],
+                    linewidth=1.5,
+                )
+            ax.set(
+                title=f"Output throughput ({window:g} s bins)",
+                xlabel="Time since first arrival (s)",
+                ylabel="Output tokens / s",
+                xlim=(0, edges[-1]),
+                ylim=(0, None),
+            )
+        elif metric == "cumulative":
+            for i, run in enumerate(runs):
+                origin = run.origin
+                times = sorted(time - origin for time in run.token_times())
+                ax.step(
+                    [0, *times, end],
+                    [0, *range(1, len(times) + 1), len(times)],
+                    where="post",
+                    label=run.label,
+                    color=colors[i % len(colors)],
+                )
+            ax.set(
+                title="Cumulative output",
+                xlabel="Time since first arrival (s)",
+                ylabel="Output tokens",
+                xlim=(0, max(end, window)),
+                ylim=(0, None),
+            )
+        elif view == "cdf":
+            for i, (run, sample) in enumerate(zip(runs, samples)):
+                values = list(sample[metric].values())
+                if values:
+                    ax.ecdf(
+                        values,
+                        label=run.label,
+                        color=colors[i % len(colors)],
+                    )
+            ax.set(
+                title=LATENCIES[metric],
+                xlabel=f"Latency ({metric_unit(metric)})",
+                ylabel="CDF",
+                xlim=(0, None),
+                ylim=(0, 1),
+            )
+        else:
+            reference = samples[0][metric]
+            maximum = max(reference.values(), default=0)
+            for i, (run, sample) in enumerate(zip(runs[1:], samples[1:]), 1):
+                candidate = sample[metric]
+                if reference:
+                    ax.scatter(
+                        list(reference.values()),
+                        [candidate[key] for key in reference],
+                        s=12,
+                        alpha=0.45,
+                        label=run.label,
+                        color=colors[i % len(colors)],
+                        rasterized=metric == "itl",
+                    )
+                    maximum = max(maximum, max(candidate.values()))
+            bound = maximum * 1.05 or 1
+            ax.plot([0, bound], [0, bound], color="0.4", linestyle="--", linewidth=1)
+            ax.set(
+                title=LATENCIES[metric],
+                xlabel=f"{runs[0].label} ({metric_unit(metric)})",
+                ylabel=f"Prediction ({metric_unit(metric)})",
+                xlim=(0, bound),
+                ylim=(0, bound),
+            )
+            ax.set_aspect("equal", adjustable="box")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize="small", frameon=False)
+        else:
+            ax.text(
+                0.5, 0.5, "No eligible samples", ha="center", transform=ax.transAxes
+            )
+    for ax in list(axes.flat)[len(metrics) :]:
+        ax.remove()
     if title:
-        ax.set_title(title, fontsize=18)
-    ax.legend(frameon=False, fontsize=13, loc="upper right")
-    ax.set_xlim(left=0.0)
-    ax.set_ylim(bottom=0.0)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
-
-def main(
-    output_dir: Path = typer.Argument(),
-    output: Path = typer.Option(..., "--output"),
-    window_sec: float = typer.Option(1.0, "--window-sec"),
-    title: str | None = typer.Option(None, "--title"),
-) -> None:
-    series_specs = discover_series_specs(output_dir)
-    if not series_specs:
-        typer.echo(f"skip: no JSONLs found under {output_dir}")
-        return
-
+        figure.suptitle(title)
     try:
-        draw_plot(output, series_specs, window_sec, title or output_dir.name)
-    except ThroughputError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1) from exc
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=180)
+    finally:
+        plt.close(figure)
 
-    typer.echo(str(output))
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "runs", nargs="+", help="[LABEL=]PATH to result JSONLs; first is the reference"
+    )
+    parser.add_argument(
+        "--output", type=Path, required=True, help="PNG, SVG, or PDF path"
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=[*LATENCIES, "throughput", "cumulative"],
+        default=["ttft", "tpot", "itl", "e2e", "request_e2e", "throughput"],
+    )
+    parser.add_argument(
+        "--view",
+        choices=["cdf", "scatter"],
+        default="cdf",
+        help="latency view; throughput and cumulative always use time",
+    )
+    parser.add_argument(
+        "--window-sec",
+        type=positive_float,
+        default=1,
+        help="throughput bin width; does not affect comparison metrics",
+    )
+    parser.add_argument("--title")
+    parser.add_argument("--columns", type=int, default=3)
+    parser.add_argument(
+        "--size",
+        nargs=2,
+        type=positive_float,
+        metavar=("WIDTH", "HEIGHT"),
+        help="figure size in inches",
+    )
+    args = parser.parse_args()
+    try:
+        runs = load_runs(args.runs)
+        if args.columns < 1:
+            raise ValueError("columns must be positive")
+        if args.view == "scatter" and len(runs) < 2:
+            raise ValueError("scatter requires a reference and at least one candidate")
+        protect_output(args.output, runs)
+        draw(
+            runs,
+            args.output,
+            list(dict.fromkeys(args.metrics)),
+            args.view,
+            args.window_sec,
+            args.title,
+            args.columns,
+            args.size,
+        )
+        print(args.output)
+    except (ValueError, OSError) as exc:
+        parser.exit(1, f"error: {exc}\n")
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    main()

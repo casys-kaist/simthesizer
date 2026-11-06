@@ -1,59 +1,13 @@
 [project]
 name = "simthesizer"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.12,<3.13"
+description = "Simthesizer Python tooling"
+requires-python = ">=3.14,<3.15"
+dependencies = ["matplotlib>=3.9,<4"]
 
 [dependency-groups]
-dev = [
-  "ruff>=0.15.8",
-]
-baseline = [
-  "aiohttp",
-  "joblib",
-  "msgspec",
-  "pandas",
-  "protobuf",
-  "pydantic",
-  "pyinstrument",
-  "scikit-learn",
-  "transformers",
-]
-general = [
-  "pyyaml",
-  "typer",
-]
-real = [
-  "deep-ep",
-  "deep-gemm",
-  "deepmerge",
-  "matplotlib",
-  "vllm==0.16.*",
-]
-
-[build-system]
-requires = ["uv_build>=0.10.9,<0.11.0"]
-build-backend = "uv_build"
+dev = ["ruff"]
+vllm = ["vllm==0.31.0"]
 
 [tool.uv]
-default-groups = ["general", "baseline", "real", "dev"]
-
-[tool.uv.build-backend]
-module-root = "python"
-
-[tool.uv.sources]
-deep-gemm = { git = "https://github.com/deepseek-ai/DeepGEMM" }
-deep-ep = { git = "https://github.com/deepseek-ai/DeepEP" }
-
-[tool.uv.extra-build-dependencies]
-deep-ep = ["setuptools", { requirement = "torch", match-runtime = true }]
-deep-gemm = [
-  "setuptools",
-  "wheel",
-  "packaging",
-  { requirement = "torch", match-runtime = true }
-]
-
-[tool.uv.extra-build-variables]
-deep-gemm = { DG_USE_LOCAL_VERSION = "0" }
+package = false

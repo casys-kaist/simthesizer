@@ -42,7 +42,6 @@ struct FlowTransferState {
 
 #[derive(Debug, Clone)]
 struct PathState {
-    bottleneck_bandwidth: f64,
     total_latency: f64,
     hops: usize,
     path_nodes: Vec<NetworkDeviceID>,
@@ -97,11 +96,11 @@ impl FlowNetworkSimulator {
     }
 
     fn find_shortest_route(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> Result<Route> {
+        let bandwidth = self.widest_bandwidth(src, dst)?;
         let mut frontier = HashMap::new();
         frontier.insert(
             src,
             PathState {
-                bottleneck_bandwidth: f64::INFINITY,
                 total_latency: 0.0,
                 hops: 0,
                 path_nodes: vec![src],
@@ -126,8 +125,10 @@ impl FlowNetworkSimulator {
 
             for &link_index in outgoing {
                 let link = &self.links[link_index];
+                if link.bandwidth < bandwidth || settled.contains(&link.dst) {
+                    continue;
+                }
                 let next_path = PathState {
-                    bottleneck_bandwidth: current_path.bottleneck_bandwidth.min(link.bandwidth),
                     total_latency: current_path.total_latency + link.latency,
                     hops: current_path.hops + 1,
                     path_nodes: current_path
@@ -165,6 +166,32 @@ impl FlowNetworkSimulator {
         })
     }
 
+    fn widest_bandwidth(&self, src: NetworkDeviceID, dst: NetworkDeviceID) -> Result<f64> {
+        let mut widths = HashMap::from([(src, f64::INFINITY)]);
+        let mut settled = HashSet::new();
+        loop {
+            let Some((&node, &width)) = widths
+                .iter()
+                .filter(|(node, _)| !settled.contains(*node))
+                .max_by(|(a, aw), (b, bw)| aw.total_cmp(bw).then_with(|| b.cmp(a)))
+            else {
+                bail!("network links must be configured before transfers start");
+            };
+            if node == dst {
+                return Ok(width);
+            }
+            settled.insert(node);
+            for &index in self.outgoing_links.get(&node).into_iter().flatten() {
+                let link = &self.links[index];
+                let candidate = width.min(link.bandwidth);
+                widths
+                    .entry(link.dst)
+                    .and_modify(|best| *best = best.max(candidate))
+                    .or_insert(candidate);
+            }
+        }
+    }
+
     fn next_frontier_node(
         &self,
         frontier: &HashMap<NetworkDeviceID, PathState>,
@@ -178,11 +205,6 @@ impl FlowNetworkSimulator {
     }
 
     fn compare_paths(left: &PathState, right: &PathState) -> Ordering {
-        match Self::compare_f64(right.bottleneck_bandwidth, left.bottleneck_bandwidth) {
-            Ordering::Equal => {}
-            ordering => return ordering,
-        }
-
         match Self::compare_f64(left.total_latency, right.total_latency) {
             Ordering::Equal => left
                 .hops
@@ -516,6 +538,9 @@ impl NetworkSimulator for FlowNetworkSimulator {
         now: f64,
         state: &mut Option<Box<dyn Any>>,
     ) -> Result<PollResult> {
+        if !now.is_finite() || now < self.time {
+            bail!("network time must be finite and nondecreasing");
+        }
         self.advance(now)?;
         self.reconcile_flow_states()?;
 
@@ -534,17 +559,10 @@ impl NetworkSimulator for FlowNetworkSimulator {
             return Ok(PollResult::Complete { latency: 0.0 });
         }
 
-        let delay_s = self.with_flow(flow_id, |flow| {
-            if flow.remaining_bytes > 0.0 {
-                let rate = self.active_rates().get(&flow_id).copied().unwrap_or(0.0);
-                if rate <= 0.0 {
-                    return Err(anyhow!("network flow has no active route bandwidth"));
-                }
-                Ok(flow.remaining_bytes / rate)
-            } else {
-                Ok(flow.propagation_remaining)
-            }
-        })??;
+        // Another flow finishing can increase this flow's rate before its old estimate.
+        let delay_s = self
+            .next_event_delay()?
+            .ok_or_else(|| anyhow!("network flow has no active route bandwidth"))?;
 
         Ok(PollResult::Pending { latency: delay_s })
     }

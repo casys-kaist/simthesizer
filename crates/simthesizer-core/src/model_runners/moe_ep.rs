@@ -55,7 +55,7 @@ fn parse_payload(payload: Box<dyn Any>) -> Result<LogicalPayload> {
 
 #[derive(Debug, Clone)]
 struct MoeRouting {
-    source_tokens: Vec<u64>,
+    remote_tokens: Vec<Vec<u64>>,
     local_tokens: Vec<u64>,
     activated_experts: Vec<u64>,
 }
@@ -134,6 +134,7 @@ impl MoeExpertParallelRunner {
         num_experts_per_token: u32,
         num_shared_experts_per_token: u32,
     ) -> MoeRouting {
+        let mut remote_tokens = vec![vec![0_u64; self.ep as usize]; self.ep as usize];
         let mut local_tokens = vec![0_u64; self.ep as usize];
         let mut activated_experts = vec![HashSet::new(); self.ep as usize];
 
@@ -158,6 +159,9 @@ impl MoeExpertParallelRunner {
                 }
                 for owner in local_owners {
                     local_tokens[owner] += 1;
+                    if owner != src_rank as usize {
+                        remote_tokens[src_rank as usize][owner] += 1;
+                    }
                 }
             }
         }
@@ -172,7 +176,7 @@ impl MoeExpertParallelRunner {
             .collect();
 
         MoeRouting {
-            source_tokens,
+            remote_tokens,
             local_tokens,
             activated_experts,
         }
@@ -232,9 +236,9 @@ impl MoeExpertParallelRunner {
     fn add_ep_collective(
         &self,
         previous: NodeID,
-        rank_tokens: &[u64],
+        remote_tokens: &[Vec<u64>],
         bytes_per_token: u64,
-        reduce_scatter: bool,
+        combine: bool,
         graph: &mut Graph,
     ) -> Result<NodeID> {
         if self.ep <= 1 || bytes_per_token == 0 {
@@ -248,10 +252,10 @@ impl MoeExpertParallelRunner {
                 if src_rank == dst_rank {
                     continue;
                 }
-                let tokens = if reduce_scatter {
-                    rank_tokens[dst_rank as usize]
+                let tokens = if combine {
+                    remote_tokens[dst_rank as usize][src_rank as usize]
                 } else {
-                    rank_tokens[src_rank as usize]
+                    remote_tokens[src_rank as usize][dst_rank as usize]
                 };
                 if tokens == 0 {
                     continue;
@@ -307,9 +311,9 @@ impl MoeExpertParallelRunner {
     fn add_ep_collective_multi(
         &self,
         previous: &[NodeID],
-        rank_tokens: &[u64],
+        remote_tokens: &[Vec<u64>],
         bytes_per_token: u64,
-        reduce_scatter: bool,
+        combine: bool,
         graph: &mut Graph,
     ) -> Result<NodeID> {
         if previous.len() != self.ep as usize {
@@ -328,10 +332,10 @@ impl MoeExpertParallelRunner {
                     if src_rank == dst_rank {
                         continue;
                     }
-                    let tokens = if reduce_scatter {
-                        rank_tokens[dst_rank as usize]
+                    let tokens = if combine {
+                        remote_tokens[dst_rank as usize][src_rank as usize]
                     } else {
-                        rank_tokens[src_rank as usize]
+                        remote_tokens[src_rank as usize][dst_rank as usize]
                     };
                     if tokens == 0 {
                         continue;
@@ -379,7 +383,7 @@ impl MoeExpertParallelRunner {
 
         let last_node = self.add_ep_collective(
             previous,
-            &routing.source_tokens,
+            &routing.remote_tokens,
             *dispatch_bytes_per_token,
             false,
             graph,
@@ -404,7 +408,7 @@ impl MoeExpertParallelRunner {
         let last_node = self.add_parallel_barrier(last_node, compute_nodes, graph)?;
         self.add_ep_collective(
             last_node,
-            &routing.source_tokens,
+            &routing.remote_tokens,
             *combine_bytes_per_token,
             true,
             graph,
@@ -439,7 +443,7 @@ impl MoeExpertParallelRunner {
 
         let dispatch_done = self.add_ep_collective_multi(
             previous,
-            &routing.source_tokens,
+            &routing.remote_tokens,
             *dispatch_bytes_per_token,
             false,
             graph,
@@ -464,7 +468,7 @@ impl MoeExpertParallelRunner {
         let compute_done = self.add_parallel_barrier(dispatch_done, compute_nodes, graph)?;
         let combine_done = self.add_ep_collective_multi(
             &vec![compute_done; self.ep as usize],
-            &routing.source_tokens,
+            &routing.remote_tokens,
             *combine_bytes_per_token,
             true,
             graph,
@@ -556,9 +560,25 @@ impl ModelRunner for MoeExpertParallelRunner {
     }
 
     fn init(&mut self, model: &dyn Model) -> Result<()> {
-        let _ = model;
         if self.ep == 0 {
             bail!("ep must be positive");
+        }
+        for layer in model
+            .pre_block_layers()
+            .iter()
+            .chain(model.block_layers())
+            .chain(model.post_block_layers())
+        {
+            if let Layer::Moe {
+                num_experts,
+                num_experts_per_token,
+                ..
+            } = layer
+            {
+                if u64::from(*num_experts_per_token) > *num_experts {
+                    bail!("MoE top-k exceeds the number of experts");
+                }
+            }
         }
 
         self.rng = Some(StdRng::seed_from_u64(DEFAULT_SEED));

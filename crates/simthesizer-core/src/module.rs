@@ -7,6 +7,11 @@ use crate::engine::Graph;
 use crate::types::NodeID;
 
 pub trait Module {
+    /// Read-only state in the component's own schema. Null means unavailable.
+    fn observe(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
     fn resolve_path(&mut self, _base_dir: &Path) -> Result<()> {
         Ok(())
     }

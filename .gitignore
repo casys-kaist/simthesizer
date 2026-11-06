@@ -1,30 +1,15 @@
 # build
 /target
 
-# extern
-/extern/llmservingsim/
-
-# direnv
-/.direnv/
-
 # output
 /output/
 
 # cache
 __pycache__
 
-# data
-
-# Devenv
-.devenv*
-devenv.local.nix
-devenv.local.yaml
-
-# direnv
-.direnv
-
-# pre-commit
-.pre-commit-config.yaml
-
 # lint cache
 .ruff_cache/
+
+# development environments
+.devenv*
+.venv/

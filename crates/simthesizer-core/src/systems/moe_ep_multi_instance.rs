@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
@@ -11,10 +11,10 @@ use crate::model_runner::ModelRunner;
 use crate::module::{LogicalHandler, Module};
 use crate::router::Router;
 use crate::scheduler::Scheduler;
-use crate::system::{System, SystemEvent};
+use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
-    NodeID, ParallelStrategy, ReadySubRequest, Request, RequestResult, ResultSubRequest,
-    SubRequest, SubRequestCompletion,
+    InstanceLoad, NodeID, ParallelStrategy, ReadySubRequest, Request, RequestResult,
+    ResultSubRequest, SubRequest, SubRequestCompletion,
 };
 
 #[derive(Deserialize)]
@@ -30,7 +30,7 @@ pub struct MoeEpMultiInstanceSystem {
     results: Vec<RequestResult>,
 
     #[serde(skip_deserializing, default)]
-    pending_requests: HashMap<u64, PendingRequest>,
+    pending_requests: HashMap<u64, Request>,
 
     #[serde(skip_deserializing, default)]
     request_sinks: HashMap<u64, *mut dyn LogicalHandler>,
@@ -45,12 +45,8 @@ pub struct MoeEpMultiInstanceSystem {
     wave_running: bool,
 }
 
-struct PendingRequest {
-    request: Request,
-    instance_index: usize,
-}
-
 struct ActiveRequest {
+    pending_roots: HashSet<usize>,
     request: Request,
     instance_index: usize,
     completed_results: Vec<Option<SubRequestCompletion>>,
@@ -60,6 +56,7 @@ impl ActiveRequest {
     fn new(request: Request, instance_index: usize) -> Self {
         let len = request.sub_requests.len();
         Self {
+            pending_roots: request.initial.iter().copied().collect(),
             request,
             instance_index,
             completed_results: vec![None; len],
@@ -109,6 +106,20 @@ fn parse_payload(payload: Box<dyn Any>) -> Result<LogicalPayload> {
 }
 
 impl MoeEpMultiInstanceSystem {
+    fn rank_loads(&self) -> Vec<InstanceLoad> {
+        let mut loads: Vec<_> = self.schedulers.iter().map(|s| s.instance_load()).collect();
+        for active in self.active_requests.values() {
+            let index = active.instance_index;
+            loads[index] = [
+                loads[index],
+                pending_llm_load(&active.request, active.pending_roots.iter().copied()),
+            ]
+            .into_iter()
+            .sum();
+        }
+        loads
+    }
+
     fn detached_completion_node(&mut self, current: NodeID, graph: &mut Graph) -> Result<NodeID> {
         let detached = graph.pop_edges(current)?;
         match detached.as_slice() {
@@ -242,10 +253,13 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 let pending = self.pending_requests.remove(&request_id).ok_or_else(|| {
                     anyhow!("moe_ep_multi_instance is missing request {request_id} during arrival")
                 })?;
-                self.active_requests.insert(
-                    request_id,
-                    ActiveRequest::new(pending.request, pending.instance_index),
-                );
+                let loads = self.rank_loads();
+                let instance_index = self.router.select_instance(&pending, &loads)?;
+                if instance_index >= self.schedulers.len() {
+                    bail!("router selected invalid instance index {instance_index}");
+                }
+                self.active_requests
+                    .insert(request_id, ActiveRequest::new(pending, instance_index));
                 Ok(0.0)
             }
             LogicalPayload::SubRequestArrival {
@@ -350,8 +364,9 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
                 ) = {
                     let active = self
                         .active_requests
-                        .get(&request_id)
+                        .get_mut(&request_id)
                         .ok_or_else(|| anyhow!("unknown active request {request_id}"))?;
+                    active.pending_roots.remove(&subrequest_index);
                     let sub_request = active
                         .request
                         .sub_requests
@@ -445,6 +460,12 @@ impl LogicalHandler for MoeEpMultiInstanceSystem {
 }
 
 impl Module for MoeEpMultiInstanceSystem {
+    fn observe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schedulers": self.schedulers.iter().map(|s| s.observe()).collect::<Vec<_>>()
+        })
+    }
+
     fn resolve_path(&mut self, base_dir: &Path) -> Result<()> {
         self.model_runner.resolve_path(base_dir)?;
         self.model.resolve_path(base_dir)?;
@@ -457,6 +478,17 @@ impl Module for MoeEpMultiInstanceSystem {
 }
 
 impl System for MoeEpMultiInstanceSystem {
+    fn instance_load(&self) -> InstanceLoad {
+        self.rank_loads()
+            .into_iter()
+            .chain(
+                self.pending_requests
+                    .values()
+                    .map(|request| pending_llm_load(request, request.initial.iter().copied())),
+            )
+            .sum()
+    }
+
     fn init(&mut self) -> Result<()> {
         if self.schedulers.is_empty() {
             bail!("moe_ep_multi_instance requires at least one scheduler");
@@ -515,25 +547,7 @@ impl System for MoeEpMultiInstanceSystem {
             .iter()
             .map(|sub_request| sub_request.next().to_vec())
             .collect::<Vec<_>>();
-        let loads = self
-            .schedulers
-            .iter()
-            .map(|scheduler| scheduler.instance_load())
-            .collect::<Vec<_>>();
-        let instance_index = self.router.select_instance(&request, &loads)?;
-        if instance_index >= self.schedulers.len() {
-            bail!(
-                "router selected invalid instance index {instance_index} for {} schedulers",
-                self.schedulers.len()
-            );
-        }
-        self.pending_requests.insert(
-            request_id,
-            PendingRequest {
-                request,
-                instance_index,
-            },
-        );
+        self.pending_requests.insert(request_id, request);
         if let Some(sink) = sink {
             self.request_sinks.insert(request_id, sink);
         } else {
@@ -588,6 +602,12 @@ impl System for MoeEpMultiInstanceSystem {
     }
 
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+        if !self.pending_requests.is_empty() {
+            bail!(
+                "moe_ep_multi_instance finished with {} requests still awaiting arrival",
+                self.pending_requests.len()
+            );
+        }
         if !self.active_requests.is_empty() {
             bail!(
                 "moe_ep_multi_instance finished with {} active requests still incomplete",

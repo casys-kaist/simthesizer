@@ -51,9 +51,6 @@ pub struct Qwen3MoeModel {
     kv_bytes_per_token_per_device: u64,
 
     #[serde(skip, default)]
-    scheduler_model_weight_bytes: u64,
-
-    #[serde(skip, default)]
     scheduler_kv_bytes_per_token: u64,
 }
 
@@ -337,11 +334,6 @@ impl Qwen3MoeModel {
         2 * self.kv_dim_per_device(tp_size) * u64::from(self.num_hidden_layers) * FP_BYTES
     }
 
-    fn compute_scheduler_model_weight_bytes(&self, parallel: ParallelStrategy) -> u64 {
-        self.compute_weight_bytes_per_device(parallel)
-            .div_ceil(Self::scheduler_memory_divisor(parallel.ep))
-    }
-
     fn compute_scheduler_kv_bytes_per_token(&self, parallel: ParallelStrategy) -> u64 {
         self.compute_kv_bytes_per_token_per_device(parallel.tp)
             .div_ceil(Self::scheduler_memory_divisor(parallel.ep))
@@ -432,7 +424,6 @@ impl Model for Qwen3MoeModel {
         self.weight_bytes_per_device = self.compute_weight_bytes_per_device(parallel);
         self.kv_bytes_per_token_per_device =
             self.compute_kv_bytes_per_token_per_device(parallel.tp);
-        self.scheduler_model_weight_bytes = self.compute_scheduler_model_weight_bytes(parallel);
         self.scheduler_kv_bytes_per_token = self.compute_scheduler_kv_bytes_per_token(parallel);
         Ok(())
     }
@@ -443,10 +434,6 @@ impl Model for Qwen3MoeModel {
 
     fn kv_bytes_per_token_per_device(&self) -> u64 {
         self.kv_bytes_per_token_per_device
-    }
-
-    fn scheduler_model_weight_bytes(&self) -> u64 {
-        self.scheduler_model_weight_bytes
     }
 
     fn scheduler_kv_bytes_per_token(&self) -> u64 {

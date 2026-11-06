@@ -8,6 +8,7 @@ use simthesizer_core::types::Request;
 use simthesizer_core::{Engine, Graph, System};
 
 mod write_jsonl;
+mod write_trace;
 
 use crate::write_jsonl::write_results_jsonl;
 
@@ -19,6 +20,9 @@ struct Args {
     workload: PathBuf,
     #[arg(long)]
     output_jsonl: PathBuf,
+    /// Component state at the engine clock, as JSONL.
+    #[arg(long)]
+    output_engine_trace: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -28,7 +32,24 @@ struct Config {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.output_jsonl = output_path(&args.output_jsonl)?;
+    args.output_engine_trace = args
+        .output_engine_trace
+        .as_deref()
+        .map(output_path)
+        .transpose()?;
+    if let Some(path) = &args.output_engine_trace {
+        anyhow::ensure!(
+            !path.exists(),
+            "trace output already exists: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            path != &args.output_jsonl,
+            "trace and result paths must differ"
+        );
+    }
     let config_path = args.config;
     let workload_path = args.workload;
     let mut config = load_config(&config_path)?;
@@ -42,18 +63,36 @@ fn main() -> Result<()> {
     load_workload(config.system.as_mut(), &mut graph, &workload_path)?;
 
     let engine = Engine::new(graph, config.system);
-    let results = engine.run()?;
+    let results = if let Some(path) = &args.output_engine_trace {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        let mut trace = write_trace::TraceWriter::new(std::io::BufWriter::new(file.as_file_mut()));
+        let results =
+            engine.run_with_observer(|time, system| trace.observe(time, system.observe()))?;
+        trace.finish()?;
+        file.persist_noclobber(path)?;
+        results
+    } else {
+        engine.run()?
+    };
 
-    if let Some(parent) = args.output_jsonl.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create output directory {}", parent.display())
-            })?;
-        }
-    }
     write_results_jsonl(&args.output_jsonl, &results)?;
 
     Ok(())
+}
+
+fn output_path(path: &Path) -> Result<PathBuf> {
+    let name = path.file_name().context("output path needs a filename")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    Ok(parent.canonicalize()?.join(name))
 }
 
 fn load_config(config_path: &Path) -> Result<Config> {

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
@@ -10,9 +10,9 @@ use crate::model::Model;
 use crate::model_runner::ModelRunner;
 use crate::module::{LogicalHandler, Module};
 use crate::scheduler::Scheduler;
-use crate::system::{System, SystemEvent};
+use crate::system::{pending_llm_load, System, SystemEvent};
 use crate::types::{
-    NodeID, ReadySubRequest, Request, RequestResult, ResultSubRequest, SubRequest,
+    InstanceLoad, NodeID, ReadySubRequest, Request, RequestResult, ResultSubRequest, SubRequest,
     SubRequestCompletion,
 };
 
@@ -40,6 +40,7 @@ pub struct SingleInstanceSystem {
 }
 
 struct ActiveRequest {
+    pending_roots: HashSet<usize>,
     request: Request,
     completed_results: Vec<Option<SubRequestCompletion>>,
 }
@@ -47,6 +48,7 @@ struct ActiveRequest {
 impl ActiveRequest {
     fn new(request: Request) -> Self {
         Self {
+            pending_roots: request.initial.iter().copied().collect(),
             completed_results: vec![None; request.sub_requests.len()],
             request,
         }
@@ -322,8 +324,9 @@ impl LogicalHandler for SingleInstanceSystem {
                 ) = {
                     let active = self
                         .active_requests
-                        .get(&request_id)
+                        .get_mut(&request_id)
                         .ok_or_else(|| anyhow!("unknown active request {request_id}"))?;
+                    active.pending_roots.remove(&subrequest_index);
                     let sub_request = active
                         .request
                         .sub_requests
@@ -402,6 +405,10 @@ impl LogicalHandler for SingleInstanceSystem {
 }
 
 impl Module for SingleInstanceSystem {
+    fn observe(&self) -> serde_json::Value {
+        serde_json::json!({"scheduler": self.scheduler.observe()})
+    }
+
     fn resolve_path(&mut self, base_dir: &Path) -> Result<()> {
         self.model_runner.resolve_path(base_dir)?;
         self.model.resolve_path(base_dir)?;
@@ -411,6 +418,19 @@ impl Module for SingleInstanceSystem {
 }
 
 impl System for SingleInstanceSystem {
+    fn instance_load(&self) -> InstanceLoad {
+        std::iter::once(self.scheduler.instance_load())
+            .chain(
+                self.pending_requests
+                    .values()
+                    .map(|request| pending_llm_load(request, request.initial.iter().copied())),
+            )
+            .chain(self.active_requests.values().map(|active| {
+                pending_llm_load(&active.request, active.pending_roots.iter().copied())
+            }))
+            .sum()
+    }
+
     fn init(&mut self) -> Result<()> {
         let parallel = self.model_runner.parallel_strategy();
         self.model.init(parallel)?;
@@ -504,6 +524,12 @@ impl System for SingleInstanceSystem {
     }
 
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+        if !self.pending_requests.is_empty() {
+            bail!(
+                "single_instance finished with {} requests still awaiting arrival",
+                self.pending_requests.len()
+            );
+        }
         if !self.active_requests.is_empty() {
             bail!(
                 "single_instance finished with {} active requests still incomplete",

@@ -1,9 +1,6 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
 inputs:
   nixpkgs:
-    url: github:NixOS/nixpkgs/nixpkgs-unstable
-  rust-overlay:
-    url: github:oxalica/rust-overlay
-    inputs:
-      nixpkgs:
-        follows: nixpkgs
-allowUnfree: true
+    url: github:cachix/devenv-nixpkgs/rolling
+
+allow_unfree: true

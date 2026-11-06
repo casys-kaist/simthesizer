@@ -153,13 +153,11 @@ impl Graph {
 
     pub fn pop_edges(&mut self, parent: NodeID) -> Result<Vec<NodeID>> {
         self.ensure_node_exists(parent)?;
-        let children = self
+        let parent = self
             .nodes
             .get_mut(&parent)
-            .ok_or_else(|| anyhow!("node {parent} disappeared during edge removal"))?
-            .children
-            .drain(..)
-            .collect::<Vec<_>>();
+            .ok_or_else(|| anyhow!("node {parent} disappeared during edge removal"))?;
+        let children = std::mem::take(&mut parent.children);
 
         for &child_id in &children {
             let child = self
@@ -218,10 +216,25 @@ impl Engine {
         Self { graph, system }
     }
 
-    pub fn run(mut self) -> Result<Vec<RequestResult>> {
-        let mut queue = self.ready_queue();
+    pub fn run(self) -> Result<Vec<RequestResult>> {
+        self.run_with_observer(|_, _| Ok(()))
+    }
+
+    /// Observe after all events at a timestamp, including zero-duration descendants.
+    /// The callback also receives time zero for an empty or delayed workload.
+    pub fn run_with_observer(
+        mut self,
+        mut observe: impl FnMut(f64, &dyn System) -> Result<()>,
+    ) -> Result<Vec<RequestResult>> {
+        let mut queue = self.ready_queue()?;
+        if queue.peek().is_none_or(|entry| entry.time > 0.0) {
+            observe(0.0, self.system.as_ref())?;
+        }
         while let Some(entry) = queue.pop() {
             self.process_entry(entry, &mut queue)?;
+            if queue.peek().is_none_or(|next| next.time != entry.time) {
+                observe(entry.time, self.system.as_ref())?;
+            }
         }
         if !self.graph.nodes.is_empty() {
             bail!(
@@ -232,9 +245,15 @@ impl Engine {
         self.system.into_results()
     }
 
-    fn ready_queue(&self) -> BinaryHeap<QueueEntry> {
+    fn ready_queue(&self) -> Result<BinaryHeap<QueueEntry>> {
         let mut queue = BinaryHeap::new();
         for (&node_id, node) in &self.graph.nodes {
+            if !node.start_time.is_finite() || node.start_time < 0.0 {
+                bail!(
+                    "node {node_id} has invalid release time {}",
+                    node.start_time
+                );
+            }
             if node.indegree == 0 {
                 queue.push(QueueEntry {
                     time: node.start_time,
@@ -242,7 +261,7 @@ impl Engine {
                 });
             }
         }
-        queue
+        Ok(queue)
     }
 
     fn process_entry(
@@ -338,10 +357,18 @@ impl Engine {
         };
         match poll_result {
             PollResult::Pending { latency } => {
+                let next_time = start_time + latency;
+                if !latency.is_finite()
+                    || latency <= 0.0
+                    || !next_time.is_finite()
+                    || next_time <= start_time
+                {
+                    bail!("network poll must advance finite time, got delay {latency} at {start_time}");
+                }
                 let node = self.graph.nodes.get_mut(&entry.node_id).ok_or_else(|| {
                     anyhow!("queued node {} disappeared during poll", entry.node_id)
                 })?;
-                node.start_time += latency;
+                node.start_time = next_time;
                 queue.push(QueueEntry {
                     time: node.start_time,
                     node_id: entry.node_id,
@@ -393,6 +420,10 @@ impl Engine {
         latency: f64,
         queue: &mut BinaryHeap<QueueEntry>,
     ) -> Result<()> {
+        let finish_time = start_time + latency;
+        if !latency.is_finite() || latency < 0.0 || !finish_time.is_finite() {
+            bail!("node {node_id} has invalid latency {latency} at {start_time}");
+        }
         let children = self
             .graph
             .nodes
@@ -406,7 +437,13 @@ impl Engine {
                 .nodes
                 .get_mut(&child_id)
                 .ok_or_else(|| anyhow!("child node {child_id} is missing during run"))?;
-            child.start_time = child.start_time.max(start_time + latency);
+            if !child.start_time.is_finite() || child.start_time < 0.0 {
+                bail!(
+                    "node {child_id} has invalid release time {}",
+                    child.start_time
+                );
+            }
+            child.start_time = child.start_time.max(finish_time);
             child.indegree = child
                 .indegree
                 .checked_sub(1)

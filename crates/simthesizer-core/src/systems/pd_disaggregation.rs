@@ -51,10 +51,17 @@ struct PendingRequest {
     original: Request,
     prefill_request: Request,
     prefill_instance: usize,
-    prefill_result: Option<RequestResult>,
+    prefill_result: Option<(RequestResult, f64)>,
     decode_request: Option<Request>,
     decode_instance: Option<usize>,
     sink: Option<*mut dyn LogicalHandler>,
+}
+
+struct LlmTokenData<'a> {
+    input_tokens: u32,
+    output_tokens: u32,
+    input_token_ids: Option<&'a [u32]>,
+    output_token_ids: Option<&'a [u32]>,
 }
 
 enum LogicalPayload {
@@ -98,9 +105,7 @@ impl PendingRequest {
 }
 
 impl PdDisaggregationSystem {
-    fn single_llm_sub_request(
-        request: &Request,
-    ) -> Result<(u32, u32, Option<&[u32]>, Option<&[u32]>)> {
+    fn single_llm_sub_request(request: &Request) -> Result<LlmTokenData<'_>> {
         let [sub_request] = request.sub_requests.as_slice() else {
             bail!("pd_disaggregation only supports requests with a single llm sub-request");
         };
@@ -114,37 +119,35 @@ impl PdDisaggregationSystem {
         else {
             bail!("pd_disaggregation only supports llm sub-requests");
         };
-        Ok((
-            *input_tokens,
-            *output_tokens,
-            input_token_ids.as_deref(),
-            output_token_ids.as_deref(),
-        ))
+        Ok(LlmTokenData {
+            input_tokens: *input_tokens,
+            output_tokens: *output_tokens,
+            input_token_ids: input_token_ids.as_deref(),
+            output_token_ids: output_token_ids.as_deref(),
+        })
     }
 
     fn single_llm_tokens(request: &Request) -> Result<(u32, u32)> {
-        let (input_tokens, output_tokens, _, _) = Self::single_llm_sub_request(request)?;
-        Ok((input_tokens, output_tokens))
+        let tokens = Self::single_llm_sub_request(request)?;
+        Ok((tokens.input_tokens, tokens.output_tokens))
     }
 
     fn build_llm_request(
-        request_id: u64,
+        original: &Request,
         input_tokens: u32,
         output_tokens: u32,
-        arrival_time: f64,
-        known_tokens: u32,
         kv_tokens: u32,
         input_token_ids: Option<Vec<u32>>,
         output_token_ids: Option<Vec<u32>>,
     ) -> Request {
         Request {
-            request_id,
-            arrival_time,
+            request_id: original.request_id,
+            arrival_time: original.arrival_time,
             initial: vec![0],
             sub_requests: vec![SubRequest::Llm {
                 input_tokens,
                 output_tokens,
-                known_tokens: Some(known_tokens),
+                known_tokens: Some(input_tokens),
                 kv_tokens: Some(kv_tokens),
                 next: Vec::new(),
                 interval: None,
@@ -156,44 +159,49 @@ impl PdDisaggregationSystem {
     }
 
     fn build_prefill_request(request: &Request) -> Result<Request> {
-        let (input_tokens, output_tokens, input_token_ids, output_token_ids) =
-            Self::single_llm_sub_request(request)?;
-        Ok(Self::build_llm_request(
-            request.request_id,
-            input_tokens,
-            output_tokens.min(1),
-            request.arrival_time,
-            input_tokens,
+        let tokens = Self::single_llm_sub_request(request)?;
+        let mut prefill = Self::build_llm_request(
+            request,
+            tokens.input_tokens,
+            tokens.output_tokens.min(1),
             0,
-            input_token_ids.map(<[u32]>::to_vec),
-            output_token_ids.map(<[u32]>::to_vec),
-        ))
+            tokens.input_token_ids.map(<[u32]>::to_vec),
+            tokens.output_token_ids.map(<[u32]>::to_vec),
+        );
+        if let SubRequest::Llm {
+            interval, model, ..
+        } = &mut prefill.sub_requests[0]
+        {
+            *interval = request.sub_requests[0].interval();
+            *model = request.sub_requests[0].model().map(str::to_owned);
+        }
+        Ok(prefill)
     }
 
     fn build_decode_request(
         original: &Request,
         prefill_request: &Request,
     ) -> Result<Option<Request>> {
-        let (_, original_output_tokens, original_input_token_ids, original_output_token_ids) =
-            Self::single_llm_sub_request(original)?;
+        let tokens = Self::single_llm_sub_request(original)?;
         let carried_tokens = prefill_request
             .total_input_tokens()
             .saturating_add(prefill_request.total_output_tokens());
-        let remaining_output =
-            original_output_tokens.saturating_sub(prefill_request.total_output_tokens());
+        let remaining_output = tokens
+            .output_tokens
+            .saturating_sub(prefill_request.total_output_tokens());
         if remaining_output == 0 {
             return Ok(None);
         }
 
         let carried_output = prefill_request.total_output_tokens() as usize;
-        let input_token_ids = original_input_token_ids.map(|input_token_ids| {
+        let input_token_ids = tokens.input_token_ids.map(|input_token_ids| {
             let mut combined = input_token_ids.to_vec();
-            if let Some(output_token_ids) = original_output_token_ids {
+            if let Some(output_token_ids) = tokens.output_token_ids {
                 combined.extend(output_token_ids.iter().copied().take(carried_output));
             }
             combined
         });
-        let output_token_ids = original_output_token_ids.map(|output_token_ids| {
+        let output_token_ids = tokens.output_token_ids.map(|output_token_ids| {
             output_token_ids
                 .iter()
                 .copied()
@@ -202,12 +210,10 @@ impl PdDisaggregationSystem {
         });
 
         Ok(Some(Self::build_llm_request(
-            original.request_id,
+            original,
             carried_tokens,
             remaining_output,
-            original.arrival_time,
-            carried_tokens,
-            carried_tokens,
+            prefill_request.total_input_tokens(),
             input_token_ids,
             output_token_ids,
         )))
@@ -233,8 +239,8 @@ impl PdDisaggregationSystem {
 
     fn merge_result(
         original: &Request,
-        prefill_result: RequestResult,
-        decode_result: Option<RequestResult>,
+        (prefill_result, prefill_finished_at): (RequestResult, f64),
+        decode_result: Option<(RequestResult, f64)>,
     ) -> Result<RequestResult> {
         let (input_tokens, output_tokens) = Self::single_llm_tokens(original)?;
         let ResultSubRequest::Llm {
@@ -249,9 +255,9 @@ impl PdDisaggregationSystem {
             bail!("pd_disaggregation prefill result must contain one llm sub-request");
         };
 
-        if let Some(decode_result) = decode_result {
+        if let Some((decode_result, decode_finished_at)) = decode_result {
             let ResultSubRequest::Llm {
-                token_latency: decode_token_latency,
+                token_latency: mut decode_token_latency,
                 ..
             } = decode_result
                 .sub_requests
@@ -261,7 +267,15 @@ impl PdDisaggregationSystem {
             else {
                 bail!("pd_disaggregation decode result must contain one llm sub-request");
             };
+            // Recover the first decode token's time from completion and later ITLs.
+            let later_latency: f64 = decode_token_latency.iter().skip(1).sum();
+            if let Some(first) = decode_token_latency.first_mut() {
+                *first = (decode_finished_at - prefill_finished_at - later_latency).max(0.0);
+            }
             combined_token_latency.extend(decode_token_latency);
+        }
+        if combined_token_latency.len() != output_tokens as usize {
+            bail!("pd_disaggregation completed with an incorrect output token count");
         }
 
         Ok(RequestResult {
@@ -273,8 +287,8 @@ impl PdDisaggregationSystem {
                 output_tokens,
                 next: Vec::new(),
                 token_latency: combined_token_latency,
-                interval: None,
-                model: None,
+                interval: original.sub_requests[0].interval(),
+                model: original.sub_requests[0].model().map(str::to_owned),
             }],
         })
     }
@@ -282,7 +296,7 @@ impl PdDisaggregationSystem {
     fn emit_final_result(
         &mut self,
         pending: PendingRequest,
-        decode_result: Option<RequestResult>,
+        decode_result: Option<(RequestResult, f64)>,
         current: NodeID,
         graph: &mut Graph,
     ) -> Result<()> {
@@ -312,6 +326,7 @@ impl PdDisaggregationSystem {
         &mut self,
         request: Request,
         result: RequestResult,
+        now: f64,
         current: NodeID,
         graph: &mut Graph,
     ) -> Result<f64> {
@@ -349,13 +364,11 @@ impl PdDisaggregationSystem {
                     .pending_requests
                     .get_mut(&request_id)
                     .ok_or_else(|| anyhow!("pd_disaggregation is missing request {request_id}"))?;
-                pending.prefill_result = Some(result);
+                pending.prefill_result = Some((result, now));
                 pending.decode_request = Some(decode_request.clone());
                 pending.decode_instance = Some(decode_instance);
 
-                let transfer_tokens = prefill_request
-                    .total_input_tokens()
-                    .saturating_add(prefill_request.total_output_tokens());
+                let transfer_tokens = prefill_request.total_input_tokens();
                 let transfer_bytes = u64::from(transfer_tokens)
                     .saturating_mul(self.model.kv_bytes_per_token_per_device());
                 let transfer = graph.add_network_node(
@@ -378,7 +391,7 @@ impl PdDisaggregationSystem {
                 .remove(&request_id)
                 .ok_or_else(|| anyhow!("pd_disaggregation is missing request {request_id}"))?;
             let mut pending = pending;
-            pending.prefill_result = Some(result);
+            pending.prefill_result = Some((result, now));
             self.emit_final_result(pending, None, current, graph)?;
             return Ok(0.0);
         }
@@ -400,7 +413,7 @@ impl PdDisaggregationSystem {
             .pending_requests
             .remove(&request_id)
             .ok_or_else(|| anyhow!("pd_disaggregation is missing request {request_id}"))?;
-        self.emit_final_result(pending, Some(result), current, graph)?;
+        self.emit_final_result(pending, Some((result, now)), current, graph)?;
         Ok(0.0)
     }
 
@@ -444,7 +457,7 @@ impl LogicalHandler for PdDisaggregationSystem {
     fn handle(
         &mut self,
         payload: Box<dyn Any>,
-        _now: f64,
+        now: f64,
         current: NodeID,
         graph: &mut Graph,
     ) -> Result<f64> {
@@ -453,13 +466,20 @@ impl LogicalHandler for PdDisaggregationSystem {
                 self.handle_transfer_complete(request_id, current, graph)
             }
             HandlerPayload::Event(SystemEvent::RequestCompleted { request, result }) => {
-                self.handle_child_completion(request, result, current, graph)
+                self.handle_child_completion(request, result, now, current, graph)
             }
         }
     }
 }
 
 impl Module for PdDisaggregationSystem {
+    fn observe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "prefill_instances": self.prefill_instances.iter().map(|s| s.observe()).collect::<Vec<_>>(),
+            "decode_instances": self.decode_instances.iter().map(|s| s.observe()).collect::<Vec<_>>(),
+        })
+    }
+
     fn resolve_path(&mut self, base_dir: &Path) -> Result<()> {
         for instance in &mut self.prefill_instances {
             instance.resolve_path(base_dir)?;
@@ -474,6 +494,14 @@ impl Module for PdDisaggregationSystem {
 }
 
 impl System for PdDisaggregationSystem {
+    fn instance_load(&self) -> crate::types::InstanceLoad {
+        self.prefill_instances
+            .iter()
+            .chain(&self.decode_instances)
+            .map(|system| system.instance_load())
+            .sum()
+    }
+
     fn init(&mut self) -> Result<()> {
         if self.prefill_instances.is_empty() {
             bail!("pd_disaggregation requires at least one prefill instance");
@@ -520,6 +548,14 @@ impl System for PdDisaggregationSystem {
         parent: Option<NodeID>,
         sink: Option<*mut dyn LogicalHandler>,
     ) -> Result<()> {
+        request.validate()?;
+        if request
+            .sub_requests
+            .iter()
+            .any(|sub| sub.known_tokens().is_some() || sub.kv_tokens().is_some())
+        {
+            bail!("pd_disaggregation does not support external seeded progress");
+        }
         if self.pending_requests.contains_key(&request.request_id) {
             bail!(
                 "pd_disaggregation received duplicate request id {}",
@@ -548,6 +584,51 @@ impl System for PdDisaggregationSystem {
     }
 
     fn into_results(self: Box<Self>) -> Result<Vec<RequestResult>> {
+        if !self.pending_requests.is_empty() {
+            bail!(
+                "pd_disaggregation finished with {} incomplete requests",
+                self.pending_requests.len()
+            );
+        }
         Ok(self.results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PdDisaggregationSystem, Request, SubRequest};
+
+    #[test]
+    fn decode_handoff_excludes_sampled_token_from_kv() {
+        let original = Request {
+            request_id: 1,
+            arrival_time: 2.0,
+            initial: vec![0],
+            sub_requests: vec![SubRequest::Llm {
+                input_tokens: 16,
+                output_tokens: 3,
+                known_tokens: Some(16),
+                kv_tokens: Some(0),
+                next: vec![],
+                interval: None,
+                model: None,
+                input_token_ids: Some((0..16).collect()),
+                output_token_ids: Some(vec![20, 21, 22]),
+            }],
+        };
+        let prefill = PdDisaggregationSystem::build_prefill_request(&original).unwrap();
+        let decode = PdDisaggregationSystem::build_decode_request(&original, &prefill)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode.total_input_tokens(), 17);
+        assert_eq!(decode.total_output_tokens(), 2);
+        assert_eq!(decode.sub_requests[0].known_tokens(), Some(17));
+        assert_eq!(decode.sub_requests[0].kv_tokens(), Some(16));
+        assert_eq!(decode.request_id, original.request_id);
+        assert_eq!(decode.arrival_time, original.arrival_time);
+        let tokens = PdDisaggregationSystem::single_llm_sub_request(&decode).unwrap();
+        let expected_input = (0..16).chain([20]).collect::<Vec<_>>();
+        assert_eq!(tokens.input_token_ids, Some(expected_input.as_slice()));
+        assert_eq!(tokens.output_token_ids, Some([21, 22].as_slice()));
     }
 }

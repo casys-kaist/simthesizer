@@ -1,91 +1,179 @@
-# Bird's Eye View
+# Simthesizer Architecture
 
-This repository simulates LLM serving with a discrete event engine.
-Inputs are explicit config file paths under `scenarios/<scenario>/` plus explicit canonical workload JSONL paths under `workloads/`. Scenario configs reference in-repo profiler CSVs under `data/`, so a fresh clone runs every bundled scenario without external artifacts. Workload rows may also carry optional token-id traces used for prefix-caching experiments.
-Outputs are per-request JSONL rows that preserve the workload DAG, preserve the explicit root sub-request indices, and attach per-sub-request timing.
+## Purpose and Current Boundary
 
-The main loop is:
+Simthesizer is a discrete-event simulator for LLM serving. Its native input is
+an agent workload: each request is a DAG of LLM calls and tool calls. Its
+output is per-token timing for every LLM call, in the same DAG shape.
 
-1. The CLI reads a passed-in `simthesizer.toml` path and a passed-in workload JSONL path.
-2. The CLI reads the workload and asks the selected system to seed request-arrival logical nodes into the event graph.
-3. The engine repeatedly executes ready graph nodes in timestamp order.
-4. Config deserialization builds the selected system tree, including nested system, model-runner, simulator, model, and scheduler trait objects, then the CLI resolves config-relative paths through the shared `Module` boundary before runtime initialization.
-5. Workload rows already encode the simulator-native request DAG: each request carries its arrival time, explicit `initial` root sub-request indices, plus ordered sub-requests with `kind`, token counts, optional tool-call duration, and successor indices.
-6. Logical nodes dispatch directly to their target logical-handler implementation. Systems pre-seed request DAG logical nodes plus their static dependencies, then splice in dynamic work by rewiring the currently running node's outgoing edges. Model runners expand scheduled iterations into compute, network, and runner-local logical nodes.
-7. Completed requests are accumulated and written to result JSONL.
+The implemented product is a Rust CLI that reads one scenario config and one
+canonical workload JSONL and writes one result JSONL. Compute cost comes from
+per-layer latency tables profiled with vLLM on real hardware; communication
+cost comes from a flow-level network model. `scripts/baseline.py` replays
+single-call workloads on vLLM for comparison. `scripts/compare.py` measures
+serving-metric errors; `scripts/draw.py` plots latency and throughput.
 
-# Code Map
+This document is the repository-wide architectural source of truth.
+Component-level detail lives under [`architectures/`](architectures/).
 
-- CLI entrypoint: `crates/simthesizer-cli/src/main.rs`
-- Result JSONL formatting: `crates/simthesizer-cli/src/write_jsonl.rs`
-- Batch harness manifest and path helpers: `python/simthesizer/harness.py`
-- Event engine: `crates/simthesizer-core/src/engine.rs`
-- Module trait boundary: `crates/simthesizer-core/src/module.rs`
-- System trait boundary: `crates/simthesizer-core/src/systems/system.rs`
-- PD disaggregation system: `crates/simthesizer-core/src/systems/pd_disaggregation.rs`
-- Model runner trait boundary: `crates/simthesizer-core/src/model_runners/model_runner.rs`
-- Router trait boundary: `crates/simthesizer-core/src/routers/router.rs`
-- Scheduler trait boundary: `crates/simthesizer-core/src/schedulers/scheduler.rs`
-- Local prefix-cache helper: `crates/simthesizer-core/src/schedulers/prefix_cache.rs`
-- Type definitions: `crates/simthesizer-core/src/types.rs`
-- Compute simulator trait and implementations: `crates/simthesizer-core/src/compute_sims/compute_sim.rs`, `crates/simthesizer-core/src/compute_sims/`
-- Network simulator trait and implementations: `crates/simthesizer-core/src/network_sims/network_sim.rs`, `crates/simthesizer-core/src/network_sims/`
-- Shared registry helpers: `crates/simthesizer-core/src/registry.rs`
-- System registry and registration macro: `crates/simthesizer-core/src/systems/system.rs`
-- Model registry and registration macro: `crates/simthesizer-core/src/models/model.rs`
-- Model trait and implementations: `crates/simthesizer-core/src/models/model.rs`, `crates/simthesizer-core/src/models/`
-- Model runner implementations: `crates/simthesizer-core/src/model_runners/`
-- Router implementations: `crates/simthesizer-core/src/routers/`
-- System implementations: `crates/simthesizer-core/src/systems/`
-- MoE EP multi-instance system: `crates/simthesizer-core/src/systems/moe_ep_multi_instance.rs`
-- Scheduler implementations: `crates/simthesizer-core/src/schedulers/`
+## Drivers
 
-# Architecture Invariants
+- Agent workloads are first class: dependencies, think time, and tool-call gaps
+  are simulated, not flattened into independent requests.
+- Every cost comes from a mechanism (a scheduling decision, a cache lookup, a
+  profiled kernel, a contended link), never from a tuned factor or hit rate.
+- Wrong parameters are the dominant error source, so hardware, model, and
+  serving parameters are explicit in the scenario config.
+- Adding a component is a self-contained change with no central list to edit.
+- A run is deterministic: equal config and workload give identical results.
+- A fresh clone runs every scenario under `examples/` without a GPU or external artifact.
+- Accuracy is measured against real runs, not asserted.
 
-- **Architecture Invariant:** The engine is the only component that owns event ordering. Systems may expand or rewire the graph, including detaching and reattaching the currently running node's outgoing edges, but do not directly drive time.
-- **Architecture Invariant:** Relative config paths are normalized exactly once after deserialization through the shared `Module::resolve_path` boundary and before any `init()` call performs runtime setup.
-- **Architecture Invariant:** Systems and sub-modules communicate with the engine only through opaque logical payloads they define themselves, plus compute nodes and network nodes.
-- **Architecture Invariant:** Each logical node names exactly one target `LogicalHandler`. The engine may invoke that handler through a raw pointer, but dispatch remains safe because queued handler targets must live at a stable address until their nodes run, and the engine executes logical handlers serially so mutable `handle` calls never overlap.
-- **Architecture Invariant:** Each compute node and network node names exactly one simulator trait object owned by its parent `ModelRunner`. Compute nodes may also carry runner-supplied execution context alongside the static layer descriptor and scheduled batch. The engine may invoke those simulators through raw pointers, but dispatch remains safe because systems must keep runner-owned simulator trait objects at stable addresses until the run completes, and the engine executes compute/network polling serially.
-- **Architecture Invariant:** Point-to-point network nodes remain the only network primitive in the engine. Each network node still names one `(src, dst)` transfer, but a `NetworkSimulator` may resolve that transfer over a configured multi-hop topology. Collective communication is modeled by systems as groups of ordinary network nodes plus barrier-style logical nodes.
-- **Architecture Invariant:** Each built-in model runner exposes exactly one parallelism axis. `ring` reports `ParallelStrategy { tp, pp: 1, ep: 1 }` and `moe_ep` reports `{ tp: 1, pp: 1, ep }`, so no built-in runner combines TP with EP in one run. Pipeline parallelism is deliberately absent. EP MoE dispatch and combine are runner-owned and expand into ordinary point-to-point network nodes plus barrier logical nodes.
-- **Architecture Invariant:** Config deserialization decides concrete `System`, `ModelRunner`, `Model`, `Router`, `Scheduler`, `ComputeSimulator`, and `NetworkSimulator` implementations from `kind` fields and hides that polymorphism behind trait objects.
-- **Architecture Invariant:** The committed workload format is canonical JSONL. Runtime code must not reconstruct simulator semantics from verbose raw traces or accept legacy flat request rows; it only deserializes canonical request DAGs with non-empty `sub_requests`.
-- **Architecture Invariant:** Canonical workload and result JSONL rows carry an explicit top-level `initial` list naming the root sub-request indices. That list must exactly match the indegree-0 roots implied by `sub_requests[*].next`.
-- **Architecture Invariant:** Each `SubRequest::Llm` may carry optional token-id traces (`input_token_ids`, `output_token_ids`) used by prefix-caching schedulers, so multi-sub-request requests can attach distinct prompt traces per step. Each sub-request’s `input_tokens` and optional token-id traces are authoritative for that step’s full context; runtime code must not reconstruct prompt/KV lineage from predecessor completions. Top-level request token counts and seeded progress are deliberately absent. If a system needs seeded progress for a synthetic child request, it must place optional `known_tokens` / `kv_tokens` on that child `SubRequest::Llm`.
-- **Architecture Invariant:** `SingleInstanceSystem` seeds the full per-request sub-request DAG into the engine at request arrival time. Runtime successor activation is graph-native through static completion-to-arrival edges, while dynamic LLM/tool expansion is expressed by detaching a sub-request-arrival node's completion edge and reattaching that completion node after the emitted work graph finishes.
-- **Architecture Invariant:** `SingleInstanceSystem` owns completion accounting and may either accumulate terminal `RequestResult` values locally or forward terminal completions as `SystemEvent::RequestCompleted` callbacks to a parent `LogicalHandler`. It must not reconstruct successor prompt/KV dependencies from prior completions or maintain hidden tool-call batching state outside the engine graph, and its configured `Scheduler` remains LLM-only and never receives tool-call work.
-- **Architecture Invariant:** Prefix caching is scheduler-local. Each `SingleInstanceSystem` child owns an independent GPU-local prefix cache through its configured scheduler; no cache state is shared across sibling systems, `MultiInstanceSystem` routes, or PD prefill/decode workers.
-- **Architecture Invariant:** Routers own whole-request placement only. They choose one destination index from caller-provided per-instance load snapshots and must not mutate scheduler state, schedule tokens, or split one request across multiple instances.
-- **Architecture Invariant:** `MultiInstanceSystem` does not schedule tokens itself; it only routes whole requests to child `System` instances through its configured `Router` and forwards any parent/sink linkage unchanged, while each child system keeps owning its own orchestration state, scheduler state, and completion accounting.
-- **Architecture Invariant:** `MoeEpMultiInstanceSystem` assigns each request to exactly one DP instance for its full lifetime, keeps one independent scheduler/prefix cache per DP instance, and only couples those instances at shared LLM iteration boundaries. Tool-call subrequests remain instance-local and never enter cluster scheduling.
-- **Architecture Invariant:** `PdDisaggregationSystem` owns end-to-end request lifecycle, stage transitions, and final result assembly across disaggregated prefill/decode workers. Child systems only execute seeded LLM subrequests; KV handoff latency is modeled explicitly as parent-owned point-to-point network nodes between the chosen prefill and decode workers, and the parent owns its own model config for KV-byte accounting rather than querying child systems for that value.
-- **Architecture Invariant:** Each open registry owns its own registration type, deserializer entrypoint, and convenience registration macro next to the trait it dispatches. `crates/simthesizer-core/src/registry.rs` only provides reusable helpers; it does not own a central list of registry kinds.
-- **Architecture Invariant:** `System`, `ModelRunner`, `Model`, `Router`, `Scheduler`, `ComputeSimulator`, and `NetworkSimulator` implementations are discovered through `inventory` registrations emitted by registry-specific `macro_rules!` helpers such as `register_system!`, `register_model_runner!`, `register_model!`, `register_router!`, `register_scheduler!`, `register_compute_simulator!`, and `register_network_simulator!`; the runtime must not hard-code a closed set of implementations.
-- **Architecture Invariant:** Batch harness scripts are driven by one explicit ordered manifest of `(scenario, workload)` pairs. Runner-specific `*-all` scripts must not infer a cartesian product of scenarios and workloads.
+## Current System
 
-# API Boundaries
+```mermaid
+flowchart LR
+    TOML[Scenario TOML] --> CLI
+    WL[(Workload JSONL)] --> CLI
+    CLI --> Sys[System tree]
+    CLI --> Eng[Engine]
+    Eng <--> G[(Event graph)]
+    Sys -- seed / splice --> G
+    Sys --> Sch[Scheduler]
+    Sys --> Run[ModelRunner]
+    Run --> Mod[Model]
+    Run -- compute + network nodes --> G
+    Eng --> CS[ComputeSimulator]
+    Eng --> NS[NetworkSimulator]
+    CS --> Profile[(Profiled latency JSONL)]
+    CLI --> Out[(Result JSONL)]
+```
 
-- **API Boundary:** `simthesizer-cli` owns filesystem IO and explicit config/workload path handling. `simthesizer-core` owns simulation semantics. Batch harness scripts map each explicit `(scenario, workload)` pair to conventional runner config filenames under `scenarios/<scenario>/` (`simthesizer.toml`, `baseline.json`, `real.yaml`) and canonical JSONL workloads under `workloads/<workload>.jsonl`, but runner CLIs still accept explicit file paths rather than scenario root directories. Each JSONL workload row must carry non-empty `sub_requests`; top-level request token-count fields are not part of the schema, and each `llm` sub-request may optionally include `input_token_ids` and `output_token_ids` arrays plus optional seeded-progress fields `known_tokens` / `kv_tokens`. Those per-subrequest fields are authoritative and must already describe the full context and seed state for that subrequest.
-- **API Boundary:** `Module` is the shared config-normalization boundary. Implementations use `resolve_path(base_dir)` to rewrite any relative config paths they own, and parents must delegate to nested trait objects they contain.
-- **API Boundary:** The CLI never constructs logical payloads directly. It passes parsed `Request` values to `System::add_request_arrival`, and each system decides which opaque payload type and target `LogicalHandler` pointer to enqueue. `System::add_request_arrival` also accepts an optional parent node and optional completion sink so parent systems can chain runtime-injected arrivals after existing graph nodes and receive terminal child completions without exposing child-internal payload types.
-- **API Boundary:** Root activation is an input-schema concern, not hidden runtime inference. Canonical workload parsing validates `request.initial` against `sub_requests[*].next`, systems activate those exact indices at request arrival, and result JSONL preserves the same `initial` list.
-- **API Boundary:** `ModelRunner` is the execution-planning boundary between systems and simulators. Systems own runner selection and lifetime, ask the runner for its `ParallelStrategy`, initialize it with the selected `Model`, and ask it to expand either one scheduled batch or one cluster wave of per-instance batches into engine nodes. `ComputeSimulator` and `NetworkSimulator` are runner-owned module boundaries. The built-in `ring` runner is TP-only and owns simulator initialization, TP ring topology setup, all-reduce expansion, and runner-local logical nodes such as barriers and block fast-forward markers. The built-in `moe_ep` runner is EP-only (`tp` fixed to `1`) and owns EP MoE dispatch/combine topology plus runner-supplied MoE compute context.
-- **API Boundary:** `Model` layer descriptors may include both compute markers and TP synchronization markers; compute descriptors now expose explicit names plus minimal metadata such as GEMM dimensions, attention head layout, or Mamba state shape, while `Layer::Moe` carries static EP communication metadata and relies on runner-supplied runtime context for lookup keys. Hybrid models may therefore interleave dense, attention, Mamba, and MoE block descriptors inside one flattened block plan when their per-layer structure is not uniform. In EP mode the built-in `moe_ep` runner expands one logical MoE layer into EP dispatch, one local compute node per EP rank, a synchronization barrier, and EP combine. In multi-instance EP mode it keeps non-MoE layers independent per instance batch, uses per-source predecessor edges for EP dispatch/combine traffic, rejoins at MoE synchronization barriers, and then splits back into per-instance branches after combine. Each local compute node is looked up with that rank's local token count as `key_0` and local activated-expert count as `key_1`; the simulator must not use a global union across EP ranks for MoE table lookups.
-- **API Boundary:** `SingleInstanceSystem` owns model setup, request-arrival ingestion, pre-seeding the request DAG, and completion accounting for one device-local serving stack. Its configured `Scheduler` owns only ready LLM sub-request queue state, batch admission, scheduler-local batching config such as `block_size`, `device_mem`, `device_mem_utilization`, and optional local prefix-caching behavior, conversion of finished LLM iterations into per-subrequest timing completions, and carrying detached completion-node ids through one LLM iteration so finished work can be reattached to the pre-seeded DAG. Explicit seeded progress for synthetic child requests enters through per-subrequest `SubRequest::Llm.known_tokens` / `SubRequest::Llm.kv_tokens`; runtime does not derive that state from predecessor completions. `chunked_prefill` applies `device_mem_utilization` as a multiplier on configured device memory before making admission decisions over both token-scaled KV bytes and model-supplied per-request state bytes, and, when enabled, uses block-aligned token traces to model GPU-local prefix reuse and local cache eviction. Schedulers are initialized once with scheduler-facing model-memory parameters plus the selected `ParallelStrategy`; by default those bytes match raw per-device model bytes, but an EP-cluster model may normalize them for one scheduler that represents multiple EP ranks. `chunked_prefill` interprets `max_batch` and `max_num_batched_tokens` as per-rank limits and scales its effective system-wide capacity by `ep`.
-- **API Boundary:** `Router` is the whole-request placement boundary. Callers provide one load snapshot per candidate instance plus the incoming canonical `Request`, and the router returns exactly one destination index. The built-in `round_robin` router ignores load and rotates placements, while `moe_load_balancing` minimizes current per-instance queued and running token load with request-count tie-breaks.
-- **API Boundary:** `MultiInstanceSystem` owns only request routing across child systems. It accepts `instances: Vec<Box<dyn System>>` plus a `Router`, forwards `resolve_path()` and `init()` to every child, chooses a child at request arrival time through the router, and flattens child `RequestResult` vectors at the end of the run. Its built-in default router remains `round_robin`.
-- **API Boundary:** `MoeEpMultiInstanceSystem` owns one shared `Model`, one shared EP `ModelRunner`, one independent `Scheduler` per DP/EP instance, and one `Router`. It routes each request once, preserves that assignment for every descendant subrequest, schedules one cluster wave when any scheduler has ready LLM work, and completes that wave by calling `Scheduler::done_iteration()` on every instance after the shared runner finishes. Unlike `SingleInstanceSystem`, it initializes each scheduler with raw per-device model bytes, per-request state bytes, per-token KV bytes, and a local `ParallelStrategy` with `ep = 1`, because each scheduler now models one actual DP instance rather than one logical aggregate across EP ranks.
-- **API Boundary:** `PdDisaggregationSystem` accepts separate prefill/decode child-system lists plus its own `Model` and `NetworkSimulator`. It rewrites one external request into at most two child subrequests (`prefill`, then optional `decode`), keeps the original request metadata for final JSONL output, uses its root-level model config for KV-transfer byte sizing, and merges child completion callbacks into one final `RequestResult`.
-- **API Boundary:** Registration is open across crate boundaries. Any downstream crate can expose a `System`, `Model`, `Router`, or `Scheduler` to config deserialization by depending on `simthesizer-core`, deriving `Deserialize`, and calling `register_system!(Type, "...")`, `register_model!(Type, "...")`, `register_router!(Type, "...")`, or `register_scheduler!(Type, "...")`.
-- **API Boundary:** The same open-registration rule applies to model-runner and simulator registries. Any downstream crate can expose a `ModelRunner`, `ComputeSimulator`, or `NetworkSimulator` by deriving `Deserialize` and calling `register_model_runner!(Type, "...")`, `register_compute_simulator!(Type, "...")`, or `register_network_simulator!(Type, "...")`.
-- **API Boundary:** Future registries are also open across crate boundaries. A crate that owns a new trait-level registry defines its own registration type and deserializer with the shared helper macros, then exposes its own `register_*` macro without editing `simthesizer-core`'s central registry code.
-- **API Boundary:** Result JSONL stores one ordered `token_latency` array for each LLM sub-request. Entry `0` is TTFT and entries `1..` are inter-token latencies, so result producers and consumers must not split those timings into separate schema fields.
+The engine owns virtual time and nothing else. Systems, runners, and simulators
+own all serving semantics and reach the engine only through graph nodes.
 
-# Cross-Cutting Concerns
+## Component Boundaries
 
-- Error handling uses `anyhow::Result` throughout the executable path.
-- Performance tables are loaded from a configured profiler CSV file. That native profiler artifact contains all TP variants in one file; the built-in `table_lookup` compute simulator fixes one TP slice during `ModelRunner::init`, clamps below the sampled minimum, linearly interpolates between sampled points, and linearly extrapolates above the sampled maximum.
-- Result JSONL formatting is centralized so all experiments share one schema.
-- Shared throughput analysis reconstructs decode token times by cumulatively summing each LLM sub-request's `token_latency` entries.
-- TP-specific compute profiles are selected inside that CSV file during runner-owned simulator initialization; compute nodes then pass semantic layer descriptors, batch state, and any runner-supplied execution context into the compute simulator when they execute. The built-in `table_lookup` simulator keys `Mamba` layers with the same batch-derived attention lookup axes used by the profiler's `mamba` rows.
+- `simthesizer-cli` owns filesystem IO: config and workload parsing, the path
+  resolution root, and result writing. It holds no simulation semantics.
+- The engine owns the event graph, ordering, and time. Node payloads are opaque
+  to it; see [event engine](architectures/engine.md).
+- A `System` owns request lifecycle: seeding request DAGs, splicing in work,
+  completion accounting, and composition into multi-instance and disaggregated
+  topologies; see [serving systems](architectures/systems.md).
+- A `Scheduler` owns ready LLM work, batch admission, KV memory, and its
+  prefix cache. A `Router` owns whole-request placement; see
+  [scheduling](architectures/scheduling.md).
+- A `Model` owns the layer plan and memory footprint for a parallel strategy.
+  A `ModelRunner` owns one parallelism axis and expands a batch into compute
+  and network nodes, including collectives; see
+  [model execution](architectures/execution.md).
+- A `ComputeSimulator` prices one layer for one batch. A `NetworkSimulator`
+  prices point-to-point transfers over a topology; see
+  [cost models](architectures/cost-models.md).
+- `scripts/profile.py` measures vLLM components and preserves exact batch shapes
+  in JSONL; see [profiling](architectures/profiling.md).
+- `scripts/baseline.py` replays single-call workloads and records client-visible
+  token timings; see [validation](architectures/validation.md).
+- `scripts/results.py` owns result validation, DAG timing reconstruction, and
+  serving metrics shared by comparison and plotting. Analysis never enters the
+  simulation path; see [validation](architectures/validation.md).
+- Components expose read-only state; the engine supplies observation times and
+  the CLI writes optional JSONL traces. See [observability](architectures/observability.md).
+
+Detailed contracts:
+
+- [Event engine](architectures/engine.md)
+- [Workload and results](architectures/workload.md)
+- [Configuration and registries](architectures/configuration.md)
+- [Serving systems](architectures/systems.md)
+- [Scheduling](architectures/scheduling.md)
+- [Model execution](architectures/execution.md)
+- [Cost models](architectures/cost-models.md)
+- [Profiling](architectures/profiling.md)
+- [Validation](architectures/validation.md)
+- [Observability](architectures/observability.md)
+- [Agent workflow](architectures/agent-workflow.md)
+
+## Simulation Flow
+
+1. The CLI deserializes the scenario into a tree of components, resolves
+   relative paths once, and initializes the tree top-down.
+2. It validates each workload row and hands it to the root system, which seeds
+   that request's DAG into the graph, released at its arrival time.
+3. The engine runs ready nodes in (time, node ID) order until the graph drains.
+4. A logical node calls back into its owner, which may add nodes or rewire the
+   running node's outgoing edges. Compute and network nodes ask their simulator
+   for a latency.
+5. Systems hand over finished requests; the CLI writes them by request ID.
+
+Every workload request is seeded before the engine starts. Routing runs at
+the simulated arrival, after any parent dependency, using current instance
+loads. Routed children enter the graph beneath that arrival event.
+
+## Data Contracts
+
+- Workload JSONL is the only input format: one request DAG per row. Each LLM
+  sub-request carries its own full context; runtime never reconstructs context
+  from predecessors.
+- Result JSONL repeats the input DAG and adds one `token_latency` array per LLM
+  sub-request: TTFT first, then inter-token latencies.
+- A scenario is one TOML tree whose `kind` fields select registered
+  implementations.
+- A profile holds per-component latency samples for one model on one machine.
+  JSONL preserves request shapes and measurement samples. Scenario mappings join
+  model layer names to profile component names.
+
+## Determinism and Failure
+
+- Simultaneous nodes run in creation order. Sampled MoE routing uses a fixed
+  seed. Nothing on the simulation path reads the wall clock.
+- Any inconsistency (unexpected payload, duplicate completion, unadmittable
+  request, leftover nodes, unfinished requests) aborts the run. A partial
+  result is never written.
+- Execution is single-threaded. Graph nodes reference their owners by pointer,
+  which is sound only because owners live in the boxed config tree, unmoved
+  after initialization.
+
+## Repository Shape
+
+```text
+crates/simthesizer-core/   engine, component traits, registries, built-ins
+crates/simthesizer-cli/    `simthesizer` binary: config, workload, result IO
+scripts/profile.py        standalone vLLM component profiler
+scripts/baseline.py       standalone vLLM workload replay
+scripts/results.py        shared result analysis
+scripts/compare.py        serving-metric error reports
+scripts/draw.py           latency and throughput figures
+tools/                    agent workflow and validation tools
+pyproject.toml           Python dependencies and dependency groups
+uv.lock                  locked Python dependency versions
+devenv.nix               Rust, Python/uv, and CUDA environments
+examples/profiles/        profiling receipts
+examples/data/<device>/   profiles grouped by GPU model
+examples/scenarios/       named simulator and baseline configurations
+examples/workloads/       canonical workload JSONL
+architectures/             component architecture documents
+.agents/skills/            agent skills shipped with the repository
+```
+
+`simthesizer-core` depends on no IO beyond loading profiles at
+initialization. The CLI depends on the core, never the reverse.
+
+`scripts/` contains commands for human use; `tools/` contains agent-facing tools.
+
+## Evolution Rules
+
+- Add a component by implementing its trait and registering a `kind`. Never
+  add a closed match over implementations.
+- New runtime work enters as graph nodes. No component advances time itself.
+- A new parallelism axis is a new runner; collectives stay point-to-point
+  transfers joined by barriers.
+- A new cost needs a mechanism or an explicit config knob. Propose any proxy
+  before implementing it.
+- A new model gets its own implementation and its own profile on the target
+  hardware; never alias a similar model.
+- Change the workload or result schema together with its Rust types, Python
+  IO, bundled workloads, and the workload document.
+- Architecture-affecting changes update this document and the relevant
+  component document in the same change.

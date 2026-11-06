@@ -100,10 +100,25 @@ impl Request {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
+            self.arrival_time.is_finite() && self.arrival_time >= 0.0,
+            "arrival_time must be finite and nonnegative"
+        );
+        ensure!(
             !self.sub_requests.is_empty(),
             "requests must contain at least one sub-request"
         );
         for (subrequest_index, sub_request) in self.sub_requests.iter().enumerate() {
+            for (name, value) in [
+                ("interval", sub_request.interval()),
+                ("duration", sub_request.duration()),
+            ] {
+                if let Some(value) = value {
+                    ensure!(
+                        value.is_finite() && value >= 0.0,
+                        "sub-request {subrequest_index} {name} must be finite and nonnegative"
+                    );
+                }
+            }
             if let SubRequest::Llm {
                 input_tokens,
                 output_tokens,
@@ -112,9 +127,11 @@ impl Request {
                 ..
             } = sub_request
             {
+                let total_tokens = input_tokens.checked_add(*output_tokens).ok_or_else(|| {
+                    anyhow::anyhow!("llm sub-request {subrequest_index} token count exceeds u32")
+                })?;
                 match (known_tokens, kv_tokens) {
                     (Some(known_tokens), Some(kv_tokens)) => {
-                        let total_tokens = input_tokens.saturating_add(*output_tokens);
                         ensure!(
                             *known_tokens >= *input_tokens,
                             "llm sub-request {subrequest_index} has known_tokens smaller than input_tokens"
@@ -307,6 +324,17 @@ impl InstanceLoad {
     }
 }
 
+impl std::iter::Sum for InstanceLoad {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |a, b| Self {
+            waiting_requests: a.waiting_requests + b.waiting_requests,
+            running_requests: a.running_requests + b.running_requests,
+            waiting_tokens: a.waiting_tokens + b.waiting_tokens,
+            running_tokens: a.running_tokens + b.running_tokens,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComputeContext {
     pub moe_activated_experts: Option<u64>,
@@ -374,6 +402,22 @@ fn validate_initial_indices(initial: &[usize], sub_requests: &[SubRequest]) -> R
     ensure!(
         initial == derived_initial,
         "initial sub-request indices {initial:?} do not match DAG roots {derived_initial:?}"
+    );
+
+    let mut ready = derived_initial;
+    let mut visited = 0;
+    while let Some(index) = ready.pop() {
+        visited += 1;
+        for &next in sub_requests[index].next() {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.push(next);
+            }
+        }
+    }
+    ensure!(
+        visited == sub_requests.len(),
+        "sub-request graph contains a cycle"
     );
 
     Ok(())

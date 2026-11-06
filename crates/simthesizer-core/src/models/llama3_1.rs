@@ -39,17 +39,16 @@ crate::register_model!(Llama31Model, "llama3_1");
 impl Module for Llama31Model {}
 
 impl Llama31Model {
-    fn kv_dim(&self) -> u64 {
-        let group = self.num_attention_heads / self.num_key_value_heads;
-        self.hidden_size / group
+    fn local_num_kv_heads(&self, tp_size: u32) -> u64 {
+        (self.num_key_value_heads / u64::from(tp_size)).max(1)
+    }
+
+    fn kv_dim(&self, tp_size: u32) -> u64 {
+        self.local_num_kv_heads(tp_size) * self.head_dim()
     }
 
     fn head_dim(&self) -> u64 {
         self.hidden_size / self.num_attention_heads
-    }
-
-    fn tp_divisor(tp_size: u32) -> u64 {
-        u64::from(tp_size.max(1))
     }
 
     fn tp_sync_bytes_per_token(&self) -> u64 {
@@ -65,8 +64,8 @@ impl Llama31Model {
     }
 
     fn build_dense_block_layers(&self, tp_size: u32) -> Vec<Layer> {
-        let tp = Self::tp_divisor(tp_size);
-        let kv_dim = self.kv_dim();
+        let tp = u64::from(tp_size);
+        let kv_dim = self.kv_dim(tp_size);
         let mut layers = vec![
             Layer::LayerNorm {
                 name: "layernorm".to_string(),
@@ -75,7 +74,7 @@ impl Llama31Model {
             Layer::Gemm {
                 name: "qkv_projection".to_string(),
                 m: self.hidden_size,
-                n: (self.hidden_size + 2 * kv_dim) / tp,
+                n: self.hidden_size / tp + 2 * kv_dim,
             },
             Layer::Rope {
                 name: "rope".to_string(),
@@ -85,7 +84,7 @@ impl Llama31Model {
             Layer::Attention {
                 name: "attention".to_string(),
                 num_q_heads: self.num_attention_heads / tp,
-                num_kv_heads: self.num_key_value_heads / tp,
+                num_kv_heads: self.local_num_kv_heads(tp_size),
                 head_dim: self.head_dim(),
             },
             Layer::Gemm {
@@ -130,7 +129,7 @@ impl Llama31Model {
     }
 
     fn build_post_block_layers(&self, tp_size: u32) -> Vec<Layer> {
-        let tp = Self::tp_divisor(tp_size);
+        let tp = u64::from(tp_size);
         vec![
             Layer::LayerNorm {
                 name: "final_layernorm".to_string(),
@@ -149,12 +148,12 @@ impl Llama31Model {
     }
 
     fn compute_weight_bytes_per_device(&self, tp_size: u32) -> u64 {
-        let tp = Self::tp_divisor(tp_size);
-        let kv_dim = self.kv_dim();
+        let tp = u64::from(tp_size);
+        let kv_dim = self.kv_dim(tp_size);
         let embed = (self.vocab_size / tp) * self.hidden_size;
         let q_proj = self.hidden_size * (self.hidden_size / tp);
-        let k_proj = self.hidden_size * (kv_dim / tp);
-        let v_proj = self.hidden_size * (kv_dim / tp);
+        let k_proj = self.hidden_size * kv_dim;
+        let v_proj = self.hidden_size * kv_dim;
         let o_proj = (self.hidden_size / tp) * self.hidden_size;
         let attn = q_proj + k_proj + v_proj + o_proj;
         let mlp = 2 * self.hidden_size * (self.intermediate_size / tp)
@@ -167,8 +166,7 @@ impl Llama31Model {
     }
 
     fn compute_kv_bytes_per_token_per_device(&self, tp_size: u32) -> u64 {
-        let tp = Self::tp_divisor(tp_size);
-        2 * self.kv_dim() * u64::from(self.num_hidden_layers) * FP_BYTES / tp
+        2 * self.kv_dim(tp_size) * u64::from(self.num_hidden_layers) * FP_BYTES
     }
 }
 
@@ -208,6 +206,17 @@ impl Model for Llama31Model {
         {
             bail!("num_attention_heads must be divisible by num_key_value_heads");
         }
+        let tp = u64::from(tp_size);
+        if !self.num_attention_heads.is_multiple_of(tp) {
+            bail!("num_attention_heads must be divisible by tp_size");
+        }
+        if self.num_key_value_heads >= tp {
+            if !self.num_key_value_heads.is_multiple_of(tp) {
+                bail!("num_key_value_heads must be divisible by tp_size when sharded");
+            }
+        } else if !tp.is_multiple_of(self.num_key_value_heads) {
+            bail!("tp_size must be divisible by num_key_value_heads when replicated");
+        }
 
         self.pre_block_layers = self.build_pre_block_layers();
         self.block_layers = self.build_dense_block_layers(tp_size);
@@ -239,5 +248,129 @@ impl Model for Llama31Model {
 
     fn num_blocks(&self) -> u32 {
         self.num_hidden_layers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::Scheduler;
+    use crate::types::ReadySubRequest;
+    use serde_json::json;
+
+    fn model() -> Llama31Model {
+        serde_json::from_value(json!({
+            "hidden_size": 4096, "intermediate_size": 14336,
+            "max_position_embeddings": 131072, "num_attention_heads": 32,
+            "num_hidden_layers": 32, "num_key_value_heads": 8, "vocab_size": 128256
+        }))
+        .unwrap()
+    }
+
+    fn parallel(tp: u32) -> ParallelStrategy {
+        ParallelStrategy { tp, pp: 1, ep: 1 }
+    }
+
+    #[test]
+    fn tp_shapes_and_memory_include_replicated_kv_heads() {
+        // BF16 tensor counts for the fixture, including replicated K/V weights.
+        for (tp, kv_heads, qkv_width, kv_bytes, weight_bytes) in [
+            (1, 8, 6144, 131072, 16060522496),
+            (2, 4, 3072, 65536, 8030527488),
+            (8, 1, 768, 16384, 2008031232),
+            (16, 1, 512, 16384, 1037836288),
+            (32, 1, 384, 16384, 552738816),
+        ] {
+            let mut model = model();
+            model.init(parallel(tp)).unwrap();
+            assert_eq!(model.kv_bytes_per_token_per_device(), kv_bytes, "TP={tp}");
+            assert_eq!(model.weight_bytes_per_device(), weight_bytes, "TP={tp}");
+            assert!(
+                model.block_layers().iter().any(|layer| matches!(layer,
+                    Layer::Attention { num_q_heads, num_kv_heads, head_dim, .. }
+                        if *num_q_heads == 32 / u64::from(tp)
+                            && *num_kv_heads == kv_heads && *head_dim == 128
+                )),
+                "TP={tp}"
+            );
+            assert!(
+                model.block_layers().iter().any(|layer| matches!(layer,
+                    Layer::Gemm { name, m: 4096, n } if name == "qkv_projection" && *n == qkv_width
+                )),
+                "TP={tp}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_head_partitions_fail_before_building_layers() {
+        for (q_heads, kv_heads, tp, error) in [
+            (32, 8, 0, "tp_size must be positive"),
+            (32, 8, 3, "num_attention_heads must be divisible by tp_size"),
+            (
+                32,
+                8,
+                64,
+                "num_attention_heads must be divisible by tp_size",
+            ),
+            (
+                24,
+                6,
+                4,
+                "num_key_value_heads must be divisible by tp_size when sharded",
+            ),
+            (
+                24,
+                6,
+                8,
+                "tp_size must be divisible by num_key_value_heads when replicated",
+            ),
+        ] {
+            let mut model = model();
+            model.hidden_size = q_heads * 128;
+            model.num_attention_heads = q_heads;
+            model.num_key_value_heads = kv_heads;
+            assert_eq!(model.init(parallel(tp)).unwrap_err().to_string(), error);
+            assert!(model.block_layers().is_empty());
+        }
+    }
+
+    #[test]
+    fn replicated_kv_memory_limits_admission_and_is_released() {
+        let mut model = model();
+        model.init(parallel(16)).unwrap();
+        let mut scheduler: Box<dyn Scheduler> = serde_json::from_value(json!({
+            "kind": "chunked_prefill", "block_size": 4, "max_batch": 2,
+            "max_num_batched_tokens": 8, "device_mem": 1037836288_u64 + 4 * 16384,
+            "device_mem_utilization": 1.0, "enable_prefix_caching": false
+        }))
+        .unwrap();
+        scheduler
+            .init(
+                model.scheduler_model_weight_bytes(),
+                model.scheduler_kv_bytes_per_request(),
+                model.scheduler_kv_bytes_per_token(),
+                parallel(16),
+            )
+            .unwrap();
+        for id in 0..2 {
+            scheduler.enqueue_sub_request(ReadySubRequest {
+                request_id: id,
+                subrequest_index: 0,
+                completion_node_id: id,
+                arrival_time: 0.0,
+                input_tokens: 4,
+                output_tokens: 1,
+                known_tokens: 4,
+                kv_tokens: 0,
+                input_token_ids: None,
+                output_token_ids: None,
+            });
+        }
+        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.done_iteration(1.0).len(), 1);
+        assert_eq!(scheduler.schedule().unwrap().len(), 1);
+        assert_eq!(scheduler.done_iteration(2.0).len(), 1);
+        assert!(scheduler.schedule().unwrap().is_empty());
     }
 }

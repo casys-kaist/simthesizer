@@ -170,6 +170,9 @@ impl ModelRunner for RingModelRunner {
 
     fn init(&mut self, model: &dyn Model) -> Result<()> {
         let _ = model;
+        if self.tp == 0 {
+            bail!("tp must be positive");
+        }
         let parallel = self.parallel_strategy();
         self.compute_sim.init(parallel)?;
 

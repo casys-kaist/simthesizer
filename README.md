@@ -30,6 +30,10 @@ simulator instead of rewriting it for each new mechanism.
 > 🚧 Simthesizer v1 is in progress, with a better API and more accurate
 > profiling. Stay tuned!
 
+## 📰 News
+
+- [2026/11] 🎉 Simthesizer is accepted to [HPCA 2027](https://hpca-conf.org/2027/).
+
 ## ⚙️ Requirements
 
 | Task | Needs |
